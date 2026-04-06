@@ -35,13 +35,14 @@ Run with:
 ─────────────────────────────────────────────────────────
 """
 
-import csv
 import sys
 from collections import defaultdict
 from pathlib import Path
 
-from validify.core.models import ValidationResult
-from validify.rules.built_in import NullCheckRule, RangeRule
+from validify.core.models import ValidationResult, Report
+from validify.rules.built_in import RuleFactory
+from validify.transforms.pipeline import DatasetLoader, normalize_record
+from validify.utils.decorators import timeit
 
 
 def aggregate_by_field(results: list[ValidationResult]) -> dict[str, int]:
@@ -52,62 +53,50 @@ def aggregate_by_field(results: list[ValidationResult]) -> dict[str, int]:
   return dict(sorted(counts.items(), key=lambda item: item[1], reverse=True))
 
 
-def print_report(
-  total: int,
-  passed: int,
-  failed: int,
-  failed_rows: list[dict[str, object]],
-  results: list[ValidationResult],
-) -> None:
+def print_report(report: Report, failed_rows: list[dict[str, object]]) -> None:
   line = "=" * 60
   print(f"\n{line}")
   print("VALIDATION REPORT")
   print(line)
-  print(f"  Total records : {total}")
-  print(f"  Passed        : {passed}")
-  print(f"  Failed        : {failed}")
-  print(f"  Pass rate     : {passed / total * 100:.1f}%")
+  print(f"  Total records : {report.total}")
+  print(f"  Passed        : {report.passed}")
+  print(f"  Failed        : {report.failed}")
+  print(f"  Pass rate     : {report.pass_rate}%")
 
   if failed_rows:
-    field_counts = aggregate_by_field(results)
+    field_counts = aggregate_by_field(report.results)
     print("\n  Top failing fields:")
     for field, count in list(field_counts.items())[:5]:
-      pct = count / total * 100
+      pct = count / report.total * 100
       print(f"    {field:<28} {count:>4} failures  ({pct:.1f}%)")
 
     print("\nFailed rows (first 10):")
     for item in failed_rows[:10]:
-      row = item["row"]
       messages = "; ".join(item["messages"])  # type: ignore[arg-type]
-      print(f"  Row {row:>4} | {messages}")
+      print(f"  Row {item['row']:>4} | {messages}")
     if len(failed_rows) > 10:
       print(f"  ... and {len(failed_rows) - 10} more.")
 
   print(line)
 
 
-def run_validation(csv_path: Path) -> tuple[int, int, int, list[dict[str, object]], list[ValidationResult]]:
-  rules = [
-    NullCheckRule("vendor_id"),
-    RangeRule("passenger_count", 1, 8),
-    RangeRule("trip_distance", 0.1, 200.0),
-    RangeRule("fare_amount", 0.01, 500.0),
-  ]
+@timeit
+def run_validation(csv_path: Path) -> tuple[Report, list]:
+  rules = RuleFactory.from_config("config/rules.yaml")
 
   total = 0
   passed = 0
   failed = 0
-  failed_rows: list[dict[str, object]] = []
   all_results: list[ValidationResult] = []
+  failed_rows: list[dict[str, object]] = []
 
-  fh = open(csv_path, newline="", encoding="utf-8")
-  try:
-    reader = csv.DictReader(fh)
-    for row_num, record in enumerate(reader, start=2):
+  with DatasetLoader(str(csv_path)) as records:
+    for row_num, record in enumerate(records, start=2):
       total += 1
+      normalized_record = normalize_record(record)
       row_messages: list[str] = []
       for rule in rules:
-        result = rule(record)
+        result = rule(normalized_record)
         all_results.append(result)
         if not result.passed:
           row_messages.append(result.message)
@@ -117,10 +106,9 @@ def run_validation(csv_path: Path) -> tuple[int, int, int, list[dict[str, object
         failed_rows.append({"row": row_num, "messages": row_messages})
       else:
         passed += 1
-  finally:
-    fh.close()
 
-  return total, passed, failed, failed_rows, all_results
+  report = Report(total=total, passed=passed, failed=failed, results=all_results)
+  return report, failed_rows
 
 
 def main() -> None:
@@ -133,12 +121,12 @@ def main() -> None:
         print(f"Error: file not found — {csv_path}")
         sys.exit(1)
 
-    total, passed, failed, failed_rows, results = run_validation(csv_path)
-    if total == 0:
+    report, failed_rows = run_validation(csv_path)
+    if report.total == 0:
       print("No records found in the file.")
       sys.exit(1)
 
-    print_report(total, passed, failed, failed_rows, results)
+    print_report(report, failed_rows)
 
 
 if __name__ == "__main__":

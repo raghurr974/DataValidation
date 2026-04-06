@@ -59,6 +59,7 @@ registered and works via a unit test, then merge back to main.
 
 import re  # noqa: F401 — needed by RegexRule
 import yaml  # noqa: F401 — needed by RuleFactory
+from datetime import datetime
 
 from validify.core.base import BaseValidator  # noqa: F401
 from validify.core.exceptions import ConfigError  # noqa: F401
@@ -119,3 +120,154 @@ class RangeRule(BaseValidator):
   @property
   def message(self) -> str:
     return self._message
+
+
+class CoordinateRule(BaseValidator):
+    """Fail when a geographic coordinate is outside a bounding box.
+
+    Logically identical to RangeRule — a separate class is justified because:
+      1. The config/rules.yaml type name 'coordinate_rule' is self-documenting.
+      2. Any reader immediately understands what kind of data this checks.
+      3. Coordinate-specific behaviour (e.g. validating lon/lat as a pair)
+         can be added here without touching the general RangeRule.
+    """
+
+    def __init__(self, field: str, min_val: float, max_val: float) -> None:
+        self.field = field
+        self.min_val = min_val
+        self.max_val = max_val
+        self._message = ""
+
+    def validate(self, record: dict) -> bool:
+        raw = record.get(self.field)
+        if raw is None or str(raw).strip() == "":
+            self._message = f"{self.field!r} coordinate is missing"
+            return False
+        try:
+            value = float(raw)
+        except (ValueError, TypeError):
+            self._message = f"{self.field!r} is not a number: {raw!r}"
+            return False
+        if not (self.min_val <= value <= self.max_val):
+            self._message = (
+                f"{self.field!r} = {value} out of bounds "
+                f"[{self.min_val}, {self.max_val}]"
+            )
+            return False
+        return True
+
+    @property
+    def message(self) -> str:
+        return self._message
+
+
+# ---------------------------------------------------------------------------
+# DateFormatRule
+# ---------------------------------------------------------------------------
+
+class DateFormatRule(BaseValidator):
+    """Fails when a field value cannot be parsed as a datetime in the given format.
+
+    Constructor: DateFormatRule(field, fmt="%Y-%m-%d %H:%M:%S")
+    """
+
+    def __init__(self, field: str, fmt: str = "%Y-%m-%d %H:%M:%S") -> None:
+        self.field = field
+        self.fmt = fmt
+        self._message = ""
+
+    def validate(self, record: dict) -> bool:
+        raw = record.get(self.field)
+        if raw is None or str(raw).strip() == "":
+            self._message = f"{self.field}: date is missing"
+            return False
+        try:
+            datetime.strptime(str(raw).strip(), self.fmt)
+        except ValueError:
+            self._message = (
+                f"{self.field}: '{raw}' does not match format '{self.fmt}'"
+            )
+            return False
+        self._message = ""
+        return True
+
+    @property
+    def message(self) -> str:
+        return self._message
+
+
+# ---------------------------------------------------------------------------
+# RegexRule
+# ---------------------------------------------------------------------------
+
+class RegexRule(BaseValidator):
+    """Fails when a field value does not fully match a regex pattern.
+
+    Uses re.fullmatch — the pattern must cover the entire value, not a
+    substring.  This gives precise validation (e.g. payment_type whitelist).
+
+    Constructor: RegexRule(field, pattern)
+    """
+
+    def __init__(self, field: str, pattern: str) -> None:
+        self.field = field
+        self.pattern = pattern
+        self._message = ""
+
+    def validate(self, record: dict) -> bool:
+        raw = record.get(self.field)
+        value = str(raw).strip() if raw is not None else ""
+        if not re.fullmatch(self.pattern, value):
+            self._message = (
+                f"{self.field}: '{value}' does not match pattern '{self.pattern}'"
+            )
+            return False
+        self._message = ""
+        return True
+
+    @property
+    def message(self) -> str:
+        return self._message
+
+
+# ---------------------------------------------------------------------------
+# RuleFactory
+# ---------------------------------------------------------------------------
+
+class RuleFactory:
+    """Builds a list of validator instances from a YAML config file.
+
+    Steps:
+      1. Parse the YAML file — it has a top-level "rules" list.
+      2. For each entry, look up the class by "type" via ValidatorRegistry.
+      3. Strip metadata keys ("name") that aren't constructor arguments.
+      4. Remap YAML "min"/"max" → "min_val"/"max_val" to match constructors.
+      5. Instantiate with field + remaining kwargs and return the list.
+    """
+
+    @staticmethod
+    def from_config(path: str) -> list[BaseValidator]:
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+        except FileNotFoundError as err:
+            raise ConfigError(f"Rules config file not found: {path}") from err
+
+        rules: list[BaseValidator] = []
+        for entry in data.get("rules", []):
+            entry = dict(entry)          # shallow copy — don't mutate YAML data
+            entry.pop("name", None)      # "name" is metadata, not a constructor arg
+            rule_type = entry.pop("type")
+            field = entry.pop("field")
+
+            # YAML uses "min"/"max" but constructors use "min_val"/"max_val"
+            # to avoid shadowing Python built-in names.
+            if "min" in entry:
+                entry["min_val"] = entry.pop("min")
+            if "max" in entry:
+                entry["max_val"] = entry.pop("max")
+
+            cls = ValidatorRegistry.get(rule_type)
+            rules.append(cls(field=field, **entry))
+
+        return rules

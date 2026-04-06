@@ -39,12 +39,15 @@ import io
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, UploadFile  # noqa: F401
+from fastapi import FastAPI, HTTPException, UploadFile
 
-# Add your own imports from validify modules as needed.
+from validify.core.models import Report
+from validify.engine.runner import run_sequential
+from validify.rules.built_in import RuleFactory
+from validify.transforms.pipeline import normalize_record
 
 # In-memory report store: {run_id: Report}
-REPORTS: dict = {}
+REPORTS: dict[str, Report] = {}
 
 
 def create_app() -> FastAPI:
@@ -57,6 +60,87 @@ def create_app() -> FastAPI:
     # ---------------------------------------------------------------------------
     # YOUR ROUTES BELOW
     # ---------------------------------------------------------------------------
+
+    @app.get("/")
+    async def root():
+        return {
+            "message": "Validify Data Validation API",
+            "version": "0.1.0",
+            "docs": "/docs",
+            "endpoints": {
+                "health": "GET /health",
+                "validate": "POST /validate (upload CSV file)",
+                "reports": "GET /reports/{run_id}"
+            }
+        }
+
+    @app.get("/health")
+    async def health_check():
+        return {"status": "ok", "version": "0.1.0"}
+
+    @app.post("/validate")
+    async def validate_file(file: UploadFile):
+        # Read the uploaded file
+        content = await file.read()
+        content_str = content.decode("utf-8")
+        
+        # Parse CSV
+        reader = csv.DictReader(io.StringIO(content_str))
+        records = [normalize_record(row) for row in reader]
+        
+        if not records:
+            raise HTTPException(status_code=400, detail="No records found in CSV")
+        
+        # Load rules
+        config_path = Path(__file__).parent.parent / "config" / "rules.yaml"
+        rules = RuleFactory.from_config(str(config_path))
+        
+        # Run validation
+        results = run_sequential(records, rules)
+        
+        # Count passed/failed
+        total = len(records)
+        passed = sum(1 for result in results if result.passed)
+        failed = total - passed
+        
+        # Create report
+        report = Report(total=total, passed=passed, failed=failed, results=results)
+        
+        # Generate run_id and store report
+        run_id = str(uuid.uuid4())
+        REPORTS[run_id] = report
+        
+        return {
+            "run_id": run_id,
+            "summary": {
+                "total": total,
+                "passed": passed,
+                "failed": failed,
+                "pass_rate": report.pass_rate
+            }
+        }
+
+    @app.get("/reports/{run_id}")
+    async def get_report(run_id: str):
+        if run_id not in REPORTS:
+            raise HTTPException(status_code=404, detail="Report not found")
+        
+        report = REPORTS[run_id]
+        return {
+            "total": report.total,
+            "passed": report.passed,
+            "failed": report.failed,
+            "pass_rate": report.pass_rate,
+            "results": [
+                {
+                    "field": result.field,
+                    "rule": result.rule,
+                    "passed": result.passed,
+                    "message": result.message
+                }
+                for result in report.results
+            ]
+        }
 
     return app
 
